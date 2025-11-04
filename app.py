@@ -1,20 +1,36 @@
 from flask import Flask, request, jsonify
 from google.cloud import firestore
+from google.oauth2 import service_account
 import os
 import json
 
 app = Flask(__name__)
 
-# Initialize Firestore
-db = firestore.Client()
+# Initialize Firestore with credentials
+credentials_path = os.environ.get('GOOGLE_APPLICATION_CREDENTIALS', '/etc/secrets/serviceAccountKey.json')
+
+try:
+    credentials = service_account.Credentials.from_service_account_file(credentials_path)
+    db = firestore.Client(credentials=credentials)
+    print("✅ Firestore initialized successfully")
+except Exception as e:
+    print(f"❌ Failed to initialize Firestore: {e}")
+    db = None
 
 @app.route('/', methods=['GET'])
 def home():
-    return jsonify({'status': 'ok', 'message': 'LINE Webhook is running!'})
+    return jsonify({
+        'status': 'ok', 
+        'message': 'LINE Webhook is running!',
+        'firestore_connected': db is not None
+    })
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
     """รับ webhook จาก LINE"""
+    
+    if db is None:
+        return jsonify({'status': 'error', 'message': 'Firestore not connected'}), 500
     
     try:
         body = request.get_json()
@@ -53,9 +69,11 @@ def webhook():
                     
                 elif message_type == 'video':
                     data['content'] = f"video_{message_id}"
+                    print(f"🎥 Video: {message_id}")
                     
                 elif message_type == 'sticker':
                     data['content'] = f"sticker_{event['message']['stickerId']}"
+                    print(f"😀 Sticker")
                 
                 doc_ref = db.collection('messages').add(data)
                 print(f"✅ Saved: {doc_ref[1].id}")
@@ -64,6 +82,8 @@ def webhook():
         
     except Exception as e:
         print(f"❌ Error: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 if __name__ == '__main__':
