@@ -1,51 +1,119 @@
-# inside your webhook loop, replace profile fetch with this function
+# app.py
+from flask import Flask, request, jsonify
+from google.cloud import firestore
+from google.oauth2 import service_account
+import os
+import json
 import requests
+import traceback
 
-def fetch_line_profile(source, user_id):
-    """
-    source: the event['source'] dict
-    user_id: string
-    returns: dict (profile) or None
-    """
-    if not LINE_ACCESS_TOKEN:
-        print("⚠️ LINE_CHANNEL_ACCESS_TOKEN not set.")
-        return None
+app = Flask(__name__)
 
-    headers = {"Authorization": f"Bearer {LINE_ACCESS_TOKEN}"}
+# ---------- Config ----------
+# Path to service account json (or set env var in Render)
+credentials_path = os.environ.get('GOOGLE_APPLICATION_CREDENTIALS', '/etc/secrets/serviceAccountKey.json')
+
+# LINE API
+LINE_API_PROFILE_URL = "https://api.line.me/v2/bot/profile"
+LINE_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN')  # set this in Render env
+
+# ---------- Initialize Firestore ----------
+db = None
+try:
+    credentials = service_account.Credentials.from_service_account_file(credentials_path)
+    db = firestore.Client(credentials=credentials)
+    print("✅ Firestore initialized successfully")
+except Exception as e:
+    print(f"❌ Failed to initialize Firestore: {e}")
+    db = None
+
+# ---------- Health endpoint ----------
+@app.route('/', methods=['GET'])
+def home():
+    return jsonify({
+        'status': 'ok',
+        'message': 'LINE Webhook is running!',
+        'firestore_connected': db is not None
+    })
+
+# ---------- Webhook endpoint ----------
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    """
+    รับ webhook events จาก LINE Messaging API
+    - บันทึกข้อความลง Firestore
+    - ดึง displayName โดยเรียก Profile API ของ LINE (ต้องมี LINE_CHANNEL_ACCESS_TOKEN)
+    """
+    # Ensure we always respond to LINE with 200 quickly when possible
+    if db is None:
+        return jsonify({'status': 'error', 'message': 'Firestore not connected'}), 500
+
     try:
-        src_type = source.get('type')  # 'user', 'group', or 'room'
-        if src_type == 'user':
-            url = f"https://api.line.me/v2/bot/profile/{user_id}"
-        elif src_type == 'group':
-            group_id = source.get('groupId')
-            if not group_id:
-                print("⚠️ groupId missing in source")
-                return None
-            url = f"https://api.line.me/v2/bot/group/{group_id}/member/{user_id}"
-        elif src_type == 'room':
-            room_id = source.get('roomId')
-            if not room_id:
-                print("⚠️ roomId missing in source")
-                return None
-            url = f"https://api.line.me/v2/bot/room/{room_id}/member/{user_id}"
-        else:
-            print(f"⚠️ Unknown source type: {src_type}")
-            return None
+        body = request.get_json()
+        if not body:
+            return jsonify({'status': 'error', 'message': 'No data'}), 400
 
-        resp = requests.get(url, headers=headers, timeout=6)
-        print(f"🔍 Profile API: GET {url} -> {resp.status_code}")
-        if resp.status_code == 200:
-            profile = resp.json()
-            print(f"🔎 profile: {profile}")
-            return profile
-        else:
-            # log body for debugging (may contain explanation)
-            print(f"⚠️ Profile fetch failed: {resp.status_code} {resp.text}")
-            return None
+        print(f"📥 Received webhook: {json.dumps(body, indent=2, ensure_ascii=False)}")
 
-    except Exception as e:
-        print(f"⚠️ Exception fetching profile: {e}")
-        return None
+        events = body.get('events', [])
+
+        for event in events:
+            # Only process message events (you can expand to follow, join, postback, etc.)
+            if event.get('type') != 'message':
+                continue
+
+            # Some events may not have source.userId (e.g., group if bot not allowed), guard it
+            source = event.get('source', {})
+            user_id = source.get('userId')
+            if not user_id:
+                print("⚠️ No userId in event.source, skipping")
+                continue
+
+            message = event.get('message', {})
+            message_type = message.get('type')
+            message_id = message.get('id')
+            timestamp = event.get('timestamp')
+
+            # Try to get displayName from LINE Profile API
+            display_name = None
+            if LINE_ACCESS_TOKEN:
+                try:
+                    headers = {
+                        "Authorization": f"Bearer {LINE_ACCESS_TOKEN}"
+                    }
+                    resp = requests.get(f"{LINE_API_PROFILE_URL}/{user_id}", headers=headers, timeout=5)
+                    if resp.status_code == 200:
+                        profile = resp.json()
+                        display_name = profile.get('displayName')
+                        # profile may also include pictureUrl, statusMessage
+                        print(f"👤 DisplayName: {display_name}")
+                    else:
+                        print(f"⚠️ Failed to fetch profile ({resp.status_code}): {resp.text}")
+                except Exception as e:
+                    print(f"⚠️ Exception when fetching profile: {e}")
+            else:
+                print("⚠️ LINE_CHANNEL_ACCESS_TOKEN not set — skipping profile lookup")
+
+            # Build document
+            data = {
+                'user_id': user_id,
+                'display_name': display_name,
+                'message_type': message_type,
+                'message_id': message_id,
+                'timestamp': timestamp,
+                'created_at': firestore.SERVER_TIMESTAMP,
+                'status': 'pending',
+                'printed': False
+            }
+
+            # Add content depending on type
+            if message_type == 'text':
+                data['content'] = message.get('text')
+                print(f"💬 Text: {data['content']}")
+            elif message_type == 'image':
+                data['content'] = f"image_{message_id}"
+                print(f"🖼️ Image: {message_id}")
+            elif message_type == 'video':
                 data['content'] = f"video_{message_id}"
                 print(f"🎥 Video: {message_id}")
             elif message_type == 'sticker':
